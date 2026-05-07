@@ -1,6 +1,28 @@
 // Estado global por aba
 const tabData = {};
 
+// Lista de domínios conhecidos de tracking/ad networks para heurísticas adicionais
+const KNOWN_TRACKERS = new Set([
+  "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+  "facebook.com", "fbcdn.net", "amazon-adsystem.com", "scorecardresearch.com",
+  "quantserve.com", "outbrain.com", "taboola.com", "criteo.com",
+  "rubiconproject.com", "pubmatic.com", "openx.net", "appnexus.com",
+  "adsymptotic.com", "mediamath.com", "adform.net", "turn.com",
+  "rlcdn.com", "nexac.com", "casalemedia.com", "adnxs.com", "adsrvr.org"
+]);
+
+const COOKIE_SYNC_ID_PARAMS_EXACT = new Set([
+  "id", "uid", "uuid", "userid", "user_id", "partnerid", "deviceid",
+  "cm_id", "cid", "sid", "guid", "gaid", "gclid", "fbclid", "matchid"
+]);
+
+const COOKIE_SYNC_ID_PARAMS_PARTIAL = [
+  "sync", "match", "token", "redirect", "redir", "exchange"
+];
+
+const PIXEL_RESOURCE_TYPES = new Set(["image", "imageset", "ping", "beacon", "other"]);
+const PIXEL_PATH_HINTS = ["pixel", "track", "sync", "match", "collect", "beacon", "cm", "redirect"];
+
 function initTab(tabId) {
   tabData[tabId] = {
     thirdPartyDomains: {},
@@ -24,10 +46,15 @@ function initTab(tabId) {
     cookieSyncing: [],
     hijacking: {
       suspiciousScripts: [],
-      redirectAttempts: []
+      redirectAttempts: [],
+      hookingAttempts: []
     },
     pageUrl: "",
-    pageHost: ""
+    pageHost: "",
+    _syncKeys: new Set(),
+    _hookKeys: new Set(),
+    _supercookieKeys: new Set(),
+    _storageByFrame: {}
   };
 }
 
@@ -40,24 +67,17 @@ function getHostname(url) {
   }
 }
 
-function isThirdParty(requestHost, pageHost) {
-  if (!requestHost || !pageHost) return false;
-  const getBaseDomain = host => {
-    const parts = host.split(".");
-    return parts.slice(-2).join(".");
-  };
-  return getBaseDomain(requestHost) !== getBaseDomain(pageHost);
+function getBaseDomain(host) {
+  if (!host) return "";
+  const parts = host.split(".");
+  if (parts.length <= 2) return host;
+  return parts.slice(-2).join(".");
 }
 
-// Lista de domínios conhecidos de tracking/ad networks para heurística de cookie syncing
-const KNOWN_TRACKERS = new Set([
-  "doubleclick.net", "googlesyndication.com", "googleadservices.com",
-  "facebook.com", "fbcdn.net", "amazon-adsystem.com", "scorecardresearch.com",
-  "quantserve.com", "outbrain.com", "taboola.com", "criteo.com",
-  "rubiconproject.com", "pubmatic.com", "openx.net", "appnexus.com",
-  "adsymptotic.com", "mediamath.com", "adform.net", "turn.com",
-  "rlcdn.com", "nexac.com", "casalemedia.com", "adnxs.com", "adsrvr.org"
-]);
+function isThirdParty(requestHost, pageHost) {
+  if (!requestHost || !pageHost) return false;
+  return getBaseDomain(requestHost) !== getBaseDomain(pageHost);
+}
 
 function isKnownTracker(host) {
   for (const tracker of KNOWN_TRACKERS) {
@@ -66,67 +86,327 @@ function isKnownTracker(host) {
   return false;
 }
 
+function hasLikelyIdParam(searchParams) {
+  for (const [rawKey, rawValue] of searchParams.entries()) {
+    const key = rawKey.toLowerCase();
+    const value = String(rawValue || "");
+
+    if (COOKIE_SYNC_ID_PARAMS_EXACT.has(key)) return true;
+    if (key.endsWith("_id") || key.endsWith("id")) {
+      if (!["width", "height", "grid", "fluid"].includes(key)) return true;
+    }
+    if (COOKIE_SYNC_ID_PARAMS_PARTIAL.some((token) => key.includes(token))) return true;
+
+    if (value.length >= 10 && /^[a-zA-Z0-9._%-]+$/.test(value)) {
+      if (key.includes("id") || key.includes("token")) return true;
+    }
+  }
+
+  return false;
+}
+
+function looksLikeTrackingPixel(details, urlObj) {
+  if (!PIXEL_RESOURCE_TYPES.has(details.type)) return false;
+
+  const params = urlObj.searchParams;
+  const width = (params.get("w") || params.get("width") || "").trim();
+  const height = (params.get("h") || params.get("height") || "").trim();
+  const size = (params.get("size") || params.get("sz") || "").toLowerCase().trim();
+  const pixelParam = (params.get("pixel") || params.get("px") || "").trim();
+
+  const hasOneByOne =
+    (width === "1" && height === "1") ||
+    size === "1x1" ||
+    size === "1*1" ||
+    pixelParam === "1";
+
+  const path = urlObj.pathname.toLowerCase();
+  const hasPixelPathHint = PIXEL_PATH_HINTS.some((hint) => path.includes(hint));
+
+  return hasOneByOne || hasPixelPathHint;
+}
+
+function addCookieSyncAttempt(tabId, attempt) {
+  const key = [attempt.from, attempt.to, attempt.reason, attempt.url].join("|").substring(0, 500);
+  if (tabData[tabId]._syncKeys.has(key)) return;
+
+  tabData[tabId]._syncKeys.add(key);
+  tabData[tabId].cookieSyncing.push(attempt);
+}
+
+function addHookingAttempt(tabId, attempt) {
+  const key = [attempt.target, attempt.reason, attempt.frameHost || ""].join("|");
+  if (tabData[tabId]._hookKeys.has(key)) return;
+
+  tabData[tabId]._hookKeys.add(key);
+  tabData[tabId].hijacking.hookingAttempts.push(attempt);
+}
+
+function addSupercookie(tabId, item) {
+  const fingerprint = [item.type, item.domain, item.header || "", item.value || ""].join("|").substring(0, 400);
+  if (tabData[tabId]._supercookieKeys.has(fingerprint)) return;
+
+  tabData[tabId]._supercookieKeys.add(fingerprint);
+  tabData[tabId].cookies.supercookies.push(item);
+}
+
+function sanitizeKVStorageItems(items) {
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item) => item && typeof item.key === "string")
+    .map((item) => ({
+      key: item.key,
+      size: Number(item.size) || 0,
+      domain: item.domain || "unknown"
+    }));
+}
+
+function normalizeStoreRecord(record) {
+  return {
+    key: String(record?.key ?? "(unknown)"),
+    size: Number(record?.size) || 0
+  };
+}
+
+function normalizeIndexedDBStore(store) {
+  const records = Array.isArray(store?.records)
+    ? store.records.map(normalizeStoreRecord)
+    : [];
+
+  return {
+    name: store?.name || "(sem nome)",
+    keyPath: store?.keyPath ?? null,
+    autoIncrement: Boolean(store?.autoIncrement),
+    recordCount: Number(store?.recordCount) || 0,
+    estimatedBytes: Number(store?.estimatedBytes) || 0,
+    records: records.slice(0, 100),
+    error: store?.error || undefined
+  };
+}
+
+function normalizeIndexedDBEntry(entry) {
+  const stores = Array.isArray(entry?.stores)
+    ? entry.stores.map(normalizeIndexedDBStore)
+    : [];
+
+  const totalRecords = stores.reduce((acc, store) => acc + store.recordCount, 0);
+  const totalEstimatedBytes = stores.reduce((acc, store) => acc + store.estimatedBytes, 0);
+
+  return {
+    name: entry?.name || "(sem nome)",
+    version: entry?.version ?? null,
+    domain: entry?.domain || "unknown",
+    stores,
+    totalRecords,
+    totalEstimatedBytes,
+    error: entry?.error || undefined
+  };
+}
+
+function mergeStoreRecords(existingRecords, incomingRecords) {
+  const recordsMap = new Map();
+
+  for (const record of [...existingRecords, ...incomingRecords]) {
+    const normalized = normalizeStoreRecord(record);
+    const key = `${normalized.key}::${normalized.size}`;
+    if (!recordsMap.has(key)) {
+      recordsMap.set(key, normalized);
+    }
+  }
+
+  return [...recordsMap.values()].slice(0, 100);
+}
+
+function mergeIndexedDBEntries(entries) {
+  const dbMap = new Map();
+
+  for (const rawEntry of entries) {
+    const db = normalizeIndexedDBEntry(rawEntry);
+    const dbKey = `${db.domain}::${db.name}::${db.version ?? "null"}`;
+
+    if (!dbMap.has(dbKey)) {
+      dbMap.set(dbKey, db);
+      continue;
+    }
+
+    const existingDb = dbMap.get(dbKey);
+    if (!existingDb.error && db.error) {
+      existingDb.error = db.error;
+    }
+
+    const storeMap = new Map(existingDb.stores.map((store) => [store.name, store]));
+
+    for (const incomingStore of db.stores) {
+      const currentStore = storeMap.get(incomingStore.name);
+      if (!currentStore) {
+        storeMap.set(incomingStore.name, incomingStore);
+        continue;
+      }
+
+      currentStore.keyPath = currentStore.keyPath ?? incomingStore.keyPath;
+      currentStore.autoIncrement = currentStore.autoIncrement || incomingStore.autoIncrement;
+      currentStore.recordCount = Math.max(currentStore.recordCount, incomingStore.recordCount);
+      currentStore.estimatedBytes = Math.max(currentStore.estimatedBytes, incomingStore.estimatedBytes);
+      currentStore.records = mergeStoreRecords(currentStore.records, incomingStore.records);
+      currentStore.error = currentStore.error || incomingStore.error;
+    }
+
+    existingDb.stores = [...storeMap.values()];
+    existingDb.totalRecords = existingDb.stores.reduce((acc, store) => acc + store.recordCount, 0);
+    existingDb.totalEstimatedBytes = existingDb.stores.reduce((acc, store) => acc + store.estimatedBytes, 0);
+  }
+
+  return [...dbMap.values()].sort((a, b) => {
+    const domainComp = a.domain.localeCompare(b.domain);
+    if (domainComp !== 0) return domainComp;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function dedupeKVStorage(items) {
+  const map = new Map();
+
+  for (const item of items) {
+    const normalized = {
+      key: item.key,
+      size: Number(item.size) || 0,
+      domain: item.domain || "unknown"
+    };
+
+    const id = `${normalized.domain}::${normalized.key}`;
+    const current = map.get(id);
+
+    if (!current || normalized.size > current.size) {
+      map.set(id, normalized);
+    }
+  }
+
+  return [...map.values()];
+}
+
+function rebuildStorageForTab(tabId) {
+  const frameSnapshots = Object.values(tabData[tabId]._storageByFrame);
+  const localStorageItems = [];
+  const sessionStorageItems = [];
+  const indexedDbEntries = [];
+
+  for (const snapshot of frameSnapshots) {
+    localStorageItems.push(...snapshot.localStorage);
+    sessionStorageItems.push(...snapshot.sessionStorage);
+    indexedDbEntries.push(...snapshot.indexedDB);
+  }
+
+  tabData[tabId].storage.localStorage = dedupeKVStorage(localStorageItems);
+  tabData[tabId].storage.sessionStorage = dedupeKVStorage(sessionStorageItems);
+  tabData[tabId].storage.indexedDB = mergeIndexedDBEntries(indexedDbEntries);
+}
+
+function detectCookieSyncFromPixel(tabId, details) {
+  const pageHost = tabData[tabId].pageHost;
+  const requestHost = getHostname(details.url);
+  if (!requestHost || !pageHost || !isThirdParty(requestHost, pageHost)) return;
+
+  let urlObj;
+  try {
+    urlObj = new URL(details.url);
+  } catch {
+    return;
+  }
+
+  if (!hasLikelyIdParam(urlObj.searchParams)) return;
+  if (!looksLikeTrackingPixel(details, urlObj)) return;
+
+  const sourceUrl = details.originUrl || details.documentUrl || "";
+  const sourceHost = getHostname(sourceUrl);
+  if (!sourceHost || sourceHost === requestHost) return;
+
+  // Cookie syncing entre terceiros: origem e destino são ambos terceiras partes da página
+  if (!isThirdParty(sourceHost, pageHost) || !isThirdParty(requestHost, pageHost)) return;
+
+  addCookieSyncAttempt(tabId, {
+    from: sourceHost,
+    to: requestHost,
+    url: details.url.substring(0, 240),
+    type: details.type,
+    reason: "Pixel de rastreamento com parâmetros de ID",
+    timestamp: new Date().toISOString()
+  });
+}
+
 // Monitoramento de conexões de terceira parte
 browser.webRequest.onBeforeRequest.addListener(
   (details) => {
     const { tabId, url, type, originUrl } = details;
     if (tabId < 0) return;
 
-    const pageHost = tabData[tabId]?.pageHost || getHostname(originUrl || "");
-    const requestHost = getHostname(url);
-
     if (!tabData[tabId]) initTab(tabId);
 
-    if (pageHost && isThirdParty(requestHost, pageHost)) {
+    const pageHost = tabData[tabId].pageHost || getHostname(originUrl || details.documentUrl || "");
+    const requestHost = getHostname(url);
+
+    if (pageHost && requestHost && isThirdParty(requestHost, pageHost)) {
       if (!tabData[tabId].thirdPartyDomains[requestHost]) {
         tabData[tabId].thirdPartyDomains[requestHost] = new Set();
       }
       tabData[tabId].thirdPartyDomains[requestHost].add(type);
     }
 
-    // Detecção de redirecionamentos suspeitos (hijacking)
-    if (type === "main_frame" && details.documentUrl && details.documentUrl !== url) {
-      const origHost = getHostname(details.documentUrl);
-      const newHost = getHostname(url);
-      if (origHost && newHost && origHost !== newHost) {
-        tabData[tabId].hijacking.redirectAttempts.push({
-          from: details.documentUrl,
-          to: url,
-          timestamp: new Date().toISOString()
-        });
-      }
+    // Detecção de scripts suspeitos de terceira parte (hijacking)
+    if (type === "script" && requestHost && isThirdParty(requestHost, pageHost) && isKnownTracker(requestHost)) {
+      tabData[tabId].hijacking.suspiciousScripts.push({
+        url,
+        host: requestHost,
+        reason: "Known tracker network",
+        timestamp: new Date().toISOString()
+      });
     }
 
-    // Detecção de scripts suspeitos de terceira parte (hijacking)
-    if (type === "script" && isThirdParty(requestHost, pageHost)) {
-      if (isKnownTracker(requestHost)) {
-        tabData[tabId].hijacking.suspiciousScripts.push({
-          url: url,
-          host: requestHost,
-          reason: "Known tracker network"
-        });
-      }
-    }
+    detectCookieSyncFromPixel(tabId, details);
   },
   { urls: ["<all_urls>"] },
   ["requestBody"]
 );
 
+browser.webRequest.onBeforeRedirect.addListener(
+  (details) => {
+    const { tabId, url, redirectUrl, type } = details;
+    if (tabId < 0 || !redirectUrl) return;
+    if (!tabData[tabId]) initTab(tabId);
+
+    // Mantemos o foco em redirecionamentos de navegação/frame
+    if (type !== "main_frame" && type !== "sub_frame") return;
+
+    const fromHost = getHostname(url);
+    const toHost = getHostname(redirectUrl);
+    if (fromHost && toHost && fromHost !== toHost) {
+      tabData[tabId].hijacking.redirectAttempts.push({
+        from: url,
+        to: redirectUrl,
+        timestamp: new Date().toISOString()
+      });
+    }
+  },
+  { urls: ["<all_urls>"] }
+);
+
 // Monitoramento de cookies
 browser.webRequest.onHeadersReceived.addListener(
   (details) => {
-    const { tabId, url, responseHeaders } = details;
+    const { tabId, url } = details;
+    const responseHeaders = details.responseHeaders || [];
+
     if (tabId < 0 || !tabData[tabId]) return;
 
     const pageHost = tabData[tabId].pageHost;
     const requestHost = getHostname(url);
     const thirdParty = isThirdParty(requestHost, pageHost);
-    const now = Date.now() / 1000;
 
-    for (const header of responseHeaders) {
-      if (header.name.toLowerCase() !== "set-cookie") continue;
+    const setCookieHeaders = responseHeaders.filter(
+      (header) => header.name && header.name.toLowerCase() === "set-cookie"
+    );
 
-      const cookieStr = header.value;
+    for (const header of setCookieHeaders) {
+      const cookieStr = header.value || "";
       const isSession = !/expires|max-age/i.test(cookieStr);
       const cookieEntry = {
         raw: cookieStr.substring(0, 200),
@@ -147,46 +427,33 @@ browser.webRequest.onHeadersReceived.addListener(
       } else {
         tabData[tabId].cookies.persistent.push(cookieEntry);
       }
-
-      // Detecção de HSTS supercookies (via Strict-Transport-Security com includeSubDomains)
-      for (const h of responseHeaders) {
-        if (h.name.toLowerCase() === "strict-transport-security" &&
-            /includesubdomains/i.test(h.value)) {
-          tabData[tabId].cookies.supercookies.push({
-            type: "HSTS",
-            domain: requestHost,
-            header: h.value
-          });
-        }
-        // ETags como supercookies (presença de ETag em respostas de terceiros)
-        if (h.name.toLowerCase() === "etag" && thirdParty) {
-          tabData[tabId].cookies.supercookies.push({
-            type: "ETag",
-            domain: requestHost,
-            value: h.value.substring(0, 64)
-          });
-        }
-      }
     }
 
-    // Detecção de cookie syncing: redirecionamentos entre dois trackers conhecidos com parâmetros de ID
-    const syncParams = ["uid", "userid", "user_id", "id", "uuid", "sync", "match", "cm_id", "gdpr_consent"];
-    try {
-      const urlObj = new URL(url);
-      const hasIdParam = syncParams.some(p => urlObj.searchParams.has(p));
-      if (hasIdParam && thirdParty && isKnownTracker(requestHost)) {
-        const referrer = details.responseHeaders.find(h => h.name.toLowerCase() === "referer");
-        const refHost = referrer ? getHostname(referrer.value) : "";
-        if (refHost && isKnownTracker(refHost) && refHost !== requestHost) {
-          tabData[tabId].cookieSyncing.push({
-            from: refHost,
-            to: requestHost,
-            url: url.substring(0, 200),
-            timestamp: new Date().toISOString()
-          });
-        }
+    const hstsHeader = responseHeaders.find(
+      (header) => header.name && header.name.toLowerCase() === "strict-transport-security"
+    );
+
+    if (hstsHeader && /includesubdomains/i.test(hstsHeader.value || "")) {
+      addSupercookie(tabId, {
+        type: "HSTS",
+        domain: requestHost,
+        header: (hstsHeader.value || "").substring(0, 120)
+      });
+    }
+
+    const etagHeaders = responseHeaders.filter(
+      (header) => header.name && header.name.toLowerCase() === "etag"
+    );
+
+    if (thirdParty) {
+      for (const etagHeader of etagHeaders) {
+        addSupercookie(tabId, {
+          type: "ETag",
+          domain: requestHost,
+          value: (etagHeader.value || "").substring(0, 64)
+        });
       }
-    } catch {}
+    }
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
@@ -204,27 +471,47 @@ browser.runtime.onMessage.addListener((message, sender) => {
       tabData[tabId].pageHost = getHostname(message.url);
       break;
 
-    case "STORAGE_DATA":
-      tabData[tabId].storage.localStorage = message.localStorage || [];
-      tabData[tabId].storage.sessionStorage = message.sessionStorage || [];
-      tabData[tabId].storage.indexedDB = message.indexedDB || [];
-      break;
+    case "STORAGE_DATA": {
+      const frameKey = message.frameUrl || sender.url || `frame_${sender.frameId ?? "unknown"}`;
+      tabData[tabId]._storageByFrame[frameKey] = {
+        localStorage: sanitizeKVStorageItems(message.localStorage),
+        sessionStorage: sanitizeKVStorageItems(message.sessionStorage),
+        indexedDB: Array.isArray(message.indexedDB) ? message.indexedDB.map(normalizeIndexedDBEntry) : []
+      };
 
-    case "FINGERPRINTING_ATTEMPT":
+      rebuildStorageForTab(tabId);
+      break;
+    }
+
+    case "FINGERPRINTING_ATTEMPT": {
       const { api, method } = message;
+      const event = { method, timestamp: new Date().toISOString() };
+
       if (api === "canvas") {
-        tabData[tabId].fingerprinting.canvas.push({ method, timestamp: new Date().toISOString() });
+        tabData[tabId].fingerprinting.canvas.push(event);
       } else if (api === "webgl") {
-        tabData[tabId].fingerprinting.webgl.push({ method, timestamp: new Date().toISOString() });
+        tabData[tabId].fingerprinting.webgl.push(event);
       } else if (api === "audioContext") {
-        tabData[tabId].fingerprinting.audioContext.push({ method, timestamp: new Date().toISOString() });
+        tabData[tabId].fingerprinting.audioContext.push(event);
       }
       break;
+    }
+
+    case "HOOKING_ATTEMPT": {
+      addHookingAttempt(tabId, {
+        target: message.target || "desconhecido",
+        reason: message.reason || "Substituição de função detectada",
+        frameUrl: message.frameUrl || sender.url || "",
+        frameHost: getHostname(message.frameUrl || sender.url || ""),
+        timestamp: new Date().toISOString()
+      });
+      break;
+    }
   }
 });
 
 // Inicializar aba ao navegar
-browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading" && changeInfo.url) {
     initTab(tabId);
     tabData[tabId].pageUrl = changeInfo.url;
@@ -239,113 +526,110 @@ browser.tabs.onRemoved.addListener((tabId) => {
 // API para o popup
 
 /**
- * Calcula o Privacy Score (0–100) baseado na metodologia definida pelo grupo.
- *
- * Metodologia (ver README para detalhes):
- *  - Começa com 100 pontos
- *  - Cada domínio de terceira parte exclusivo: -3 pts (máx -30)
- *  - Cada script de terceira parte suspeito: -5 pts (máx -20)
- *  - Cookies de terceira parte: -4 por cookie (máx -20)
- *  - Cookies persistentes de terceira parte: -2 extras por cookie (máx -10)
- *  - Supercookies: -5 por ocorrência (máx -15)
- *  - Itens em localStorage de terceiros: -3 por item (máx -15)
- *  - Itens em IndexedDB: -2 por item (máx -10)
- *  - Detecções de fingerprinting Canvas: -5 (máx -15)
- *  - Detecções de fingerprinting WebGL: -5 (máx -10)
- *  - Detecções de fingerprinting AudioContext: -5 (máx -10)
- *  - Cookie syncing detectado: -10 por par (máx -20)
- *  - Tentativas de redirecionamento: -10 por tentativa (máx -20)
+ * Calcula o Privacy Score (0–100) e retorna também um breakdown por categoria.
  */
 function computePrivacyScore(data) {
-  let score = 100;
-  const penalties = [];
+  const breakdown = [];
 
-  // Terceira parte
+  function addBreakdown(id, label, count, unitPenalty, cap) {
+    const penalty = Math.min((count || 0) * unitPenalty, cap);
+    breakdown.push({
+      id,
+      label,
+      count: count || 0,
+      unitPenalty,
+      cap,
+      penalty
+    });
+    return penalty;
+  }
+
   const tpDomains = Object.keys(data.thirdPartyDomains).length;
-  const tpPenalty = Math.min(tpDomains * 3, 30);
-  if (tpPenalty > 0) penalties.push(`Domínios de terceira parte: -${tpPenalty}`);
-  score -= tpPenalty;
+  const thirdPartyCookies = data.cookies.thirdParty.length;
+  const persistentTpCookies = data.cookies.persistent.filter((cookie) => cookie.thirdParty).length;
+  const supercookies = data.cookies.supercookies.length;
+  const localStorageItems = data.storage.localStorage.length;
+  const indexedDbRecords = data.storage.indexedDB.reduce(
+    (acc, db) => acc + (Number(db.totalRecords) || 0),
+    0
+  );
 
-  // Scripts suspeitos
-  const suspPenalty = Math.min(data.hijacking.suspiciousScripts.length * 5, 20);
-  if (suspPenalty > 0) penalties.push(`Scripts suspeitos: -${suspPenalty}`);
-  score -= suspPenalty;
+  const canvasEvents = data.fingerprinting.canvas.length;
+  const webglEvents = data.fingerprinting.webgl.length;
+  const audioEvents = data.fingerprinting.audioContext.length;
 
-  // Cookies de terceira parte
-  const tpCookiePenalty = Math.min(data.cookies.thirdParty.length * 4, 20);
-  if (tpCookiePenalty > 0) penalties.push(`Cookies de terceira parte: -${tpCookiePenalty}`);
-  score -= tpCookiePenalty;
+  const cookieSyncing = data.cookieSyncing.length;
+  const redirectAttempts = data.hijacking.redirectAttempts.length;
+  const suspiciousScripts = data.hijacking.suspiciousScripts.length;
+  const hookingAttempts = data.hijacking.hookingAttempts.length;
 
-  // Cookies persistentes de terceira parte
-  const persistTp = data.cookies.persistent.filter(c => c.thirdParty).length;
-  const persistPenalty = Math.min(persistTp * 2, 10);
-  if (persistPenalty > 0) penalties.push(`Cookies persistentes de terceira parte: -${persistPenalty}`);
-  score -= persistPenalty;
+  let totalPenalty = 0;
+  totalPenalty += addBreakdown("third_party_domains", "Domínios de terceira parte", tpDomains, 3, 30);
+  totalPenalty += addBreakdown("suspicious_scripts", "Scripts suspeitos", suspiciousScripts, 5, 20);
+  totalPenalty += addBreakdown("third_party_cookies", "Cookies de terceira parte", thirdPartyCookies, 4, 20);
+  totalPenalty += addBreakdown("persistent_tp_cookies", "Cookies persistentes de terceira parte", persistentTpCookies, 2, 10);
+  totalPenalty += addBreakdown("supercookies", "Supercookies", supercookies, 5, 15);
+  totalPenalty += addBreakdown("local_storage", "localStorage", localStorageItems, 3, 15);
+  totalPenalty += addBreakdown("indexeddb_records", "Registros IndexedDB", indexedDbRecords, 1, 10);
+  totalPenalty += addBreakdown("canvas_fp", "Canvas fingerprinting", canvasEvents, 5, 15);
+  totalPenalty += addBreakdown("webgl_fp", "WebGL fingerprinting", webglEvents, 5, 10);
+  totalPenalty += addBreakdown("audio_fp", "AudioContext fingerprinting", audioEvents, 5, 10);
+  totalPenalty += addBreakdown("cookie_sync", "Cookie syncing", cookieSyncing, 10, 20);
+  totalPenalty += addBreakdown("redirects", "Redirecionamentos suspeitos", redirectAttempts, 10, 20);
+  totalPenalty += addBreakdown("hooking", "Hooking de APIs críticas", hookingAttempts, 8, 20);
 
-  // Supercookies
-  const superPenalty = Math.min(data.cookies.supercookies.length * 5, 15);
-  if (superPenalty > 0) penalties.push(`Supercookies: -${superPenalty}`);
-  score -= superPenalty;
+  const score = Math.max(0, Math.min(100, 100 - totalPenalty));
 
-  // Web Storage
-  const lsPenalty = Math.min(data.storage.localStorage.length * 3, 15);
-  if (lsPenalty > 0) penalties.push(`localStorage: -${lsPenalty}`);
-  score -= lsPenalty;
+  let label;
+  let color;
+  if (score >= 80) {
+    label = "Boa privacidade";
+    color = "#27ae60";
+  } else if (score >= 60) {
+    label = "Privacidade moderada";
+    color = "#f39c12";
+  } else if (score >= 40) {
+    label = "Privacidade baixa";
+    color = "#e67e22";
+  } else {
+    label = "Privacidade muito baixa";
+    color = "#e74c3c";
+  }
 
-  const idbPenalty = Math.min(data.storage.indexedDB.length * 2, 10);
-  if (idbPenalty > 0) penalties.push(`IndexedDB: -${idbPenalty}`);
-  score -= idbPenalty;
+  const penalties = breakdown
+    .filter((item) => item.penalty > 0)
+    .map((item) => `${item.label}: -${item.penalty}`);
 
-  // Fingerprinting
-  const canvasPenalty = Math.min(data.fingerprinting.canvas.length > 0 ? 5 : 0, 15);
-  if (canvasPenalty > 0) penalties.push(`Canvas fingerprinting: -${canvasPenalty}`);
-  score -= canvasPenalty;
-
-  const webglPenalty = Math.min(data.fingerprinting.webgl.length > 0 ? 5 : 0, 10);
-  if (webglPenalty > 0) penalties.push(`WebGL fingerprinting: -${webglPenalty}`);
-  score -= webglPenalty;
-
-  const audioPenalty = Math.min(data.fingerprinting.audioContext.length > 0 ? 5 : 0, 10);
-  if (audioPenalty > 0) penalties.push(`AudioContext fingerprinting: -${audioPenalty}`);
-  score -= audioPenalty;
-
-  // Cookie syncing
-  const syncPenalty = Math.min(data.cookieSyncing.length * 10, 20);
-  if (syncPenalty > 0) penalties.push(`Cookie syncing: -${syncPenalty}`);
-  score -= syncPenalty;
-
-  // Redirecionamentos suspeitos
-  const redirPenalty = Math.min(data.hijacking.redirectAttempts.length * 10, 20);
-  if (redirPenalty > 0) penalties.push(`Redirecionamentos suspeitos: -${redirPenalty}`);
-  score -= redirPenalty;
-
-  score = Math.max(0, Math.min(100, score));
-
-  let label, color;
-  if (score >= 80) { label = "Boa privacidade"; color = "#27ae60"; }
-  else if (score >= 60) { label = "Privacidade moderada"; color = "#f39c12"; }
-  else if (score >= 40) { label = "Privacidade baixa"; color = "#e67e22"; }
-  else { label = "Privacidade muito baixa"; color = "#e74c3c"; }
-
-  return { score, label, color, penalties };
+  return {
+    score,
+    label,
+    color,
+    penalties,
+    breakdown,
+    totalPenalty
+  };
 }
 
 // Responde às consultas do popup
 browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "GET_TAB_DATA") {
-    browser.tabs.query({ active: true, currentWindow: true }).then(tabs => {
+    browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
       const tabId = tabs[0]?.id;
       if (!tabId || !tabData[tabId]) {
         sendResponse({ error: "Sem dados para esta aba." });
         return;
       }
+
       const data = tabData[tabId];
+
       // Serializar Sets para arrays
       const thirdPartyDomains = {};
       for (const [domain, types] of Object.entries(data.thirdPartyDomains)) {
         thirdPartyDomains[domain] = [...types];
       }
+
       const privacyScore = computePrivacyScore(data);
+
       sendResponse({
         pageUrl: data.pageUrl,
         thirdPartyDomains,
@@ -357,6 +641,7 @@ browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
         privacyScore
       });
     });
+
     return true; // resposta assíncrona
   }
 });

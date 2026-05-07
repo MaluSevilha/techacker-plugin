@@ -50,6 +50,24 @@
     .score-label { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
     .score-track { background: #2a2f3a; border-radius: 4px; height: 6px; overflow: hidden; }
     .score-fill { height: 100%; border-radius: 4px; transition: width 0.4s; }
+    .score-breakdown {
+      margin-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .score-break-row { display: grid; grid-template-columns: 1fr auto; column-gap: 8px; }
+    .score-break-label { font-size: 10px; color: #c9d1d9; line-height: 1.2; }
+    .score-break-value { font-size: 10px; color: #f85149; font-weight: 600; line-height: 1.2; }
+    .score-break-track {
+      grid-column: 1 / -1;
+      height: 4px;
+      border-radius: 999px;
+      background: #2a2f3a;
+      overflow: hidden;
+      margin-top: 1px;
+    }
+    .score-break-fill { height: 100%; border-radius: 999px; }
 
     /* Tabs */
     .tabs {
@@ -75,7 +93,7 @@
     .tab .badge.ok { background: #238636; }
 
     /* Panels */
-    .panel { display: none; padding: 12px 16px; max-height: 340px; overflow-y: auto; }
+    .panel { display: none; padding: 12px 16px; max-height: 360px; overflow-y: auto; }
     .panel.active { display: block; }
 
     /* Section */
