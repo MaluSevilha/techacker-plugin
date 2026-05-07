@@ -1,0 +1,54 @@
+{
+  "manifest_version": 2,
+  "name": "Privacy Monitor",
+  "version": "1.0.0",
+  "description": "Detecta e apresenta ameaças à privacidade e rastreamento em páginas web.",
+
+  "data_collection_permissions": {
+    "collects_personal_data": false,
+    "data_collection_description": "Esta extensão não coleta nem transmite dados pessoais. Toda análise ocorre localmente no navegador do usuário."
+  },
+
+  "permissions": [
+    "webRequest",
+    "webRequestBlocking",
+    "cookies",
+    "storage",
+    "tabs",
+    "activeTab",
+    "<all_urls>"
+  ],
+
+  "background": {
+    "scripts": ["privacy_monitor.js"],
+    "persistent": true
+  },
+
+  "browser_action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "1": "icons/icon-extension.png"
+    },
+    "default_title": "Privacy Monitor"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+
+  "icons": {
+    "1": "icons/icon-extension.png"
+  },
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "privacy-monitor@insper.edu.br",
+      "strict_min_version": "109.0"
+    }
+  }
+}
