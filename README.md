@@ -41,9 +41,9 @@ Neste modelo, a extensão Privacy Monitor é estruturada em três componentes pr
 
 **Background script** (`privacy_monitor.js`): roda em segundo plano, persistente durante toda a sessão do navegador. Tem acesso às APIs privilegiadas: intercepta requisições de rede via [`webRequest`](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/API/webRequest), lê headers de resposta, acessa a API de cookies e mantém o estado de cada aba em memória. É o núcleo da extensão. [^13]
 
-**Content script** (`content_script.js`): é injetado em cada página carregada, rodando no contexto do documento, mas em um *sandbox* isolado. Sua função é alcançar o que o background não consegue ver: o uso das APIs JavaScript pela própria página. Ele injeta hooks diretamente no `window` da página para interceptar chamadas de *fingerprinting* e lê o conteúdo do *Web Storage* [^14].
+**Content script** (`content_script.js`): é injetado em cada página carregada, rodando no contexto do documento, mas em um *sandbox* isolado. Sua função é alcançar o que o background não consegue ver: o uso das APIs JavaScript pela própria página. Ele injeta hooks diretamente no `window` da página para interceptar chamadas de *fingerprinting*, monitora sobrescritas de funções nativas (*hooking*) e lê o conteúdo do *Web Storage* e *IndexedDB* em profundidade [5] [^14].
 
-**Popup** (`popup/`): interface HTML/JS que abre ao clicar no ícone da extensão. Consulta o background via `browser.runtime.sendMessage` e renderiza os dados coletados para aquela aba.
+**Popup** (`popup/`): interface HTML/JS que abre ao clicar no ícone da extensão. Consulta o background via `browser.runtime.sendMessage` e renderiza os dados coletados para aquela aba, incluindo o breakdown visual por categoria do *Privacy Score*.
 
 A comunicação entre esses componentes ocorre por troca de mensagens, e não há compartilhamento direto de contexto ou memória entre eles. Essa separação é uma propriedade fundamental do modelo de segurança das *WebExtensions* e garante que código com privilégios elevados não interaja diretamente com o conteúdo das páginas.
 
@@ -77,13 +77,13 @@ A extensão monitora automaticamente todas as abas. Não é necessária nenhuma 
 
 Ao clicar no ícone, o popup exibe o *Privacy Score* da página atual no topo e cinco abas com os dados detalhados:
 
-|      Aba      |                            O que mostra                            |
-|---------------|--------------------------------------------------------------------|
-| **Terceiros** | Domínios externos e tipos de recurso                               |
-| **Cookies**   | Cookies organizados por categoria (incluindo supercookies)         |
-| **Storage**   | Conteúdo de *localStorage*, *sessionStorage* e bancos *IndexedDB*  |
-| **Fingerpr.** | Chamadas de fingerprinting interceptadas e pares de cookie syncing |
-| **Hijack**    | Scripts suspeitos e tentativas de redirecionamento                 |
+|      Aba      |                            O que mostra                                        |
+|---------------|--------------------------------------------------------------------------------|
+| **Terceiros** | Domínios externos e tipos de recurso                                           |
+| **Cookies**   | Cookies organizados por categoria (incluindo supercookies)                     |
+| **Storage**   | Conteúdo de *localStorage*, *sessionStorage* e bancos *IndexedDB*              |
+| **Fingerpr.** | Chamadas de fingerprinting interceptadas e pares de cookie syncing             |
+| **Hijack**    | Scripts suspeitos, hooking de funções nativas e tentativas de redirecionamento |
 
 Os dados são resetados a cada navegação para uma nova página.
 
@@ -130,7 +130,7 @@ ___
 
 Qualquer *script* de terceira parte rodando na página tem acesso ao storage da origem daquela página, que não é do seu próprio domínio. Isso significa que um script de analytics pode escrever em `localStorage` sob o domínio do site que o incluiu.
 
-**Como está sendo detectado:** o *content script* lê `localStorage` e `sessionStorage` diretamente após o carregamento da página. Para casos em que se usa o IndexedDB, chamamos `indexedDB.databases()` para listar os bancos disponíveis e abrimos cada um para inspecionar seus object stores e registros.
+**Como está sendo detectado:** o *content script* lê `localStorage` e `sessionStorage` diretamente após o carregamento da página. Para o IndexedDB, a inspeção vai além da simples listagem de bancos: o script abre cada banco via `indexedDB.open()`, percorre todos os *object stores* disponíveis e itera os registros via cursor, calculando o tamanho estimado de cada entrada. O resultado exibido no popup inclui nome do banco, nome dos *object stores*, número de registros e tamanho total estimado em bytes (tudo agrupado por origem).
 
 ---
 
@@ -151,24 +151,23 @@ ___
 
 **O que é:** em geral, redes de publicidade precisam unificar seus identificadores de usuário entre diferentes domínios. Assim, se a rede A e a rede B querem saber que o mesmo usuário visitou dois sites diferentes, uma precisa comunicar seu ID para a outra. Isso é feito via redirecionamentos: o browser é mandado de `ad-network-a.com?uid=123&redirect=ad-network-b.com?uid_from_a=123`. Cada rede registra a equivalência e constrói um grafo de identidade *cross-site*.[^11]
 
-**Como está sendo detectado:** monitora-se as requisições onde o domínio de destino é um tracker conhecido e a URL contém parâmetros típicos de sincronismo (`uid`, `uuid`, `user_id`, `sync`, `match` e etc). Quando o referer também é um tracker diferente, registra-se o par como sincronismo detectado.
-
+**Como está sendo detectado:** a detecção combina duas heurísticas complementares. A primeira monitora requisições onde o domínio de destino é um tracker conhecido e a URL contém parâmetros típicos de sincronismo (`uid`, `uuid`, `user_id`, `sync`, `match`, entre outros). Quando o referer também é um tracker diferente, o par é registrado como sincronismo. Já a segunda heurística detecta *pixels de rastreamento* (requisições para domínios de terceira parte que retornam imagens de 1×1 pixel carregando parâmetros de ID), uma técnica usada por redes de publicidade para confirmar a entrega de um identificador sem depender de redirecionamento explícito. Por fim, eventos duplicados são deduplicados para reduzir o ruído na interface.
 ___
 
 ### 6. Browser Hijacking
 
 **O que é:** o sequestro de browser é a modificação não autorizada do comportamento do navegador. Ela pode ocorrer via extensões maliciosas, *scripts* injetados por XSS, ou código de terceira parte que sobrescreve funções nativas do browser para interceptar dados ou redirecionar tráfego.[^12]
 
-**Como está sendo detectado:** a detecção aplicada foca em dois vetores:
+**Como está sendo detectado:** a detecção aplicada foca em três vetores:
 1. ***Scripts* suspeitos:** *scripts* carregados de domínios que são *ad networks* ou *data brokers* conhecidos têm capacidade de executar código arbitrário na página. Mantêm-se uma lista de domínios de redes conhecidas e sinalizamos scripts carregados dessas origens.
-2. ***Hooking* de funções nativas:** o *content script* verifica se funções críticas como `document.write`, `window.open`, `history.pushState` e o *setter* de `document.cookie` foram sobrescritas por código da página. Essa técnica é usada tanto por *malware* quanto por *scripts* de analytics agressivos.
-3. **Redirecionamentos não autorizados:** Detecta-se quando uma requisição de `main_frame` muda de domínio de base sem interação do usuário.
+2. ***Hooking* de funções nativas:** o *content script* monitora ativamente a sobrescrita de funções críticas do browser: `document.write`, `window.open`, `history.pushState` e o *setter* de `document.cookie`. O monitoramento é feito via `Object.defineProperty` no contexto da página, assim, quando qualquer dessas funções é substituída por uma versão customizada, o evento `HOOKING_ATTEMPT` é disparado para o background com o nome da função afetada. Essa técnica é usada tanto por *malware* quanto por *scripts* de analytics agressivos para interceptar a navegação do usuário.
+3. **Redirecionamentos não autorizados:** detecta-se quando uma requisição de `main_frame` muda de domínio de base sem interação do usuário.
 
 ___
 
 ### 7. Privacy Score
 
-É a pontuação de 0 a 100 que resume o nível de exposição à privacidade na página atual. A ideia é começar em 100 e ir decrementando conforme os vetores detectados.
+É a pontuação de 0 a 100 que resume o nível de exposição à privacidade na página atual. A ideia é começar em 100 e ir decrementando conforme os vetores detectados. No popup, cada categoria contribuinte é exibida com uma **barra proporcional** indicando sua penalização relativa, permitindo identificar visualmente quais fatores mais impactaram o score daquela página.
 
 **Tabela de penalidades:**
 
@@ -224,9 +223,10 @@ Com base no score calculado, gera-se a classificação da privacidade mantida po
 │  │content_script.js │   │  popup/popup.js       │    │
 │  │                  │   │  popup/popup.html     │    │
 │  │ hooks de FP      │   │                       │    │
-│  │ localStorage     │   │  renderiza tabData    │    │
-│  │ sessionStorage   │   │  exibe Privacy Score  │    │
-│  │ IndexedDB        │   │                       │    │
+│  │ hooking nativo   │   │  renderiza tabData    │    │
+│  │ localStorage     │   │  breakdown do score   │    │
+│  │ sessionStorage   │   │                       │    │
+│  │ IndexedDB (deep) │   │                       │    │
 │  └──────────────────┘   └──────────────────────┘    │
 └─────────────────────────────────────────────────────┘
 ```
@@ -243,7 +243,7 @@ privacy-monitor/
 │   ├── popup.html         # Interface do popup
 │   └── popup.js           # Renderização e comunicação com o background
 ├── content_script.js      # Injetado em cada página (hooks de FP e leitura de storage)
-├── json_schemas.py
+├── json_schemas.py        # Schemas de validação dos dados trocados entre componentes
 ├── manifest.json          # Manifesto Manifest V2, permissões e declaração de data_collection
 ├── privacy_monitor.js     # Background script (interceptação de rede, cookies, estado global)
 └── README.md              # Este arquivo
