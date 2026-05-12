@@ -132,6 +132,10 @@ Qualquer *script* de terceira parte rodando na página tem acesso ao storage da 
 
 **Como está sendo detectado:** o *content script* lê `localStorage` e `sessionStorage` diretamente após o carregamento da página. Para o IndexedDB, a inspeção vai além da simples listagem de bancos: o script abre cada banco via `indexedDB.open()`, percorre todos os *object stores* disponíveis e itera os registros via cursor, calculando o tamanho estimado de cada entrada. O resultado exibido no popup inclui nome do banco, nome dos *object stores*, número de registros e tamanho total estimado em bytes (tudo agrupado por origem).
 
+**Limitação técnica: atribuição de domínio no Web Storage**
+A API do Web Storage não registra qual script escreveu cada entrada: toda chave em `localStorage` ou sessionStorage pertence à origem da página, independentemente de ter sido criada pelo site principal ou por um script de terceira parte carregado nele. Isso é uma restrição estrutural do modelo de segurança da web: a same-origin policy garante que apenas scripts rodando sob aquela origem acessem aquele storage, mas não mantém proveniência por entrada.[^9]
+Na prática, isso significa que um script de analytics carregado de `tracker.com` que escreve em `localStorage` sob `uol.com.br` (por exemplo) deixa sua entrada registrada como sendo de `uol.com.br`, sem rastro de autoria. A extensão exibe o domínio da origem, que é a única informação disponível via API, e não o domínio do script responsável pela escrita. Para rastrear autoria com mais granularidade, seria necessário interceptar as chamadas `localStorage.setItem()` no content script e correlacioná-las com o script em execução no momento, o que exigiria instrumentação adicional do call stack via `Error().stack`, com precisão limitada.
+
 ---
 
 ### 4. Browser Fingerprinting
